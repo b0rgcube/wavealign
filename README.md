@@ -24,10 +24,19 @@ The tool exports FIR filters as WAV files for convolver-based playback chains.
 - Python 3.10+
 - Dependencies listed in `Required.txt`
 
+## Setup
+
+Create and activate a virtual environment:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
 Install dependencies:
 
 ```bash
-python3 -m pip install -r Required.txt
+pip install -r Required.txt
 ```
 
 ## Input Measurements

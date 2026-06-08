@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,7 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 from scipy import signal
-from scipy.fft import ifft, irfft, rfft, rfftfreq
+from scipy.fft import irfft, rfft, rfftfreq
 
 
 EPS = 1e-12
@@ -80,17 +81,29 @@ def _smooth_log_freq(freqs: np.ndarray, values: np.ndarray, octave_fraction: flo
 
 
 def _minimum_phase_spectrum_from_mag(mag_lin: np.ndarray, n_fft: int) -> np.ndarray:
-	"""Real cepstrum minimum-phase reconstruction from one-sided magnitude."""
+	"""Real cepstrum minimum-phase reconstruction from one-sided magnitude.
+
+	Input: one-sided rfft-shaped magnitude array of length n_fft//2 + 1.
+	Output: one-sided complex spectrum of the same length.
+
+	irfft reconstructs the full even-symmetric two-sided log-magnitude so
+	the cepstrum is computed correctly rather than zero-padding the missing
+	negative-frequency half (the ifft path's failure mode).
+	"""
 	log_mag = np.log(np.maximum(mag_lin, EPS))
-	ceps = ifft(log_mag, n=n_fft).real
+	# irfft treats log_mag as one-sided and returns a real, length-n_fft cepstrum.
+	ceps = irfft(log_mag, n=n_fft)
 	ceps_min = np.zeros_like(ceps)
 	ceps_min[0] = ceps[0]
 	if n_fft % 2 == 0:
+		# Even: keep DC, double positive-quefrency bins, keep Nyquist, zero negative.
 		nyq = n_fft // 2
 		ceps_min[1:nyq] = 2.0 * ceps[1:nyq]
 		ceps_min[nyq] = ceps[nyq]
 	else:
+		# Odd: keep DC, double positive-quefrency bins, zero negative.
 		ceps_min[1:(n_fft + 1) // 2] = 2.0 * ceps[1:(n_fft + 1) // 2]
+	# rfft of the liftered real cepstrum gives the one-sided minimum-phase spectrum.
 	return np.exp(rfft(ceps_min, n=n_fft))
 
 
@@ -159,29 +172,97 @@ def _focus_response(focus_ir: np.ndarray, n_fft: int, fs: int, octave_fraction: 
 	return _smooth_log_freq(freqs, m, octave_fraction=octave_fraction)
 
 
-def _target_curve_db(
-	freqs: np.ndarray,
-	curve: str,
-	bass_boost_db: float,
-	treble_tilt_db_per_oct: float,
-) -> np.ndarray:
-	target = np.zeros_like(freqs)
-	if curve == "flat":
+@dataclass
+class TargetCurveParams:
+	"""All parameters that shape the target equalization curve."""
+	curve: str = "custom"
+	bass_boost_db: float = 5.0
+	treble_tilt_db_per_oct: float = -0.8
+	tilt_anchor_hz: float = 1000.0
+	mid_bass_lift_db: float = 0.0
+	mid_bass_lift_hz: float = 280.0
+	mid_bass_lift_q: float = 1.2
+	presence_shelf_db: float = 0.0
+	presence_shelf_hz: float = 3000.0
+	air_shelf_db: float = 0.0
+	air_shelf_hz: float = 10000.0
+	# Crossover Hz is needed for the bass-shelf corner (shelf_corner = crossover*2).
+	crossover_hz: float = 60.0
+
+
+def _high_shelf_db(freqs: np.ndarray, corner_hz: float, gain_db: float) -> np.ndarray:
+	"""Shelf using a raised-cosine transition: 0 below corner/sqrt(2), gain_db above corner*sqrt(2)."""
+	if gain_db == 0.0:
+		return np.zeros_like(freqs)
+	f_lo = corner_hz / np.sqrt(2.0)
+	f_hi = corner_hz * np.sqrt(2.0)
+	fade = _raised_cosine_transition(freqs, f_lo, f_hi, invert=True)
+	return gain_db * fade
+
+
+def _target_curve_db(freqs: np.ndarray, params: TargetCurveParams) -> np.ndarray:
+	"""Return the target EQ curve in dB at each frequency bin.
+
+	LAYER 0 — flat: all zeros.
+	LAYER 1 — bass shelf: log-linear taper from bass_boost_db at DC to 0 dB at shelf_corner.
+	LAYER 2 — treble tilt: slope in dB/octave above tilt_anchor_hz.
+	LAYER 3 — mid-bass bell: symmetrical log-frequency bell (skip when lift == 0).
+	LAYER 4 — presence shelf: high shelf at presence_shelf_hz.
+	LAYER 5 — air shelf: high shelf at air_shelf_hz.
+
+	Harman branch overrides layers 1-5 with a fixed shape; user params are ignored there.
+	"""
+	target = np.zeros_like(freqs, dtype=float)
+	if params.curve == "flat":
 		return target
 
-	# Bass shelf centered around crossover neighborhood for a "grand" presentation.
-	for i, f in enumerate(freqs):
-		if f < 20.0:
-			target[i] = bass_boost_db
-		elif f < 120.0:
-			target[i] = bass_boost_db * (1.0 - (np.log2(f) - np.log2(20.0)) / (np.log2(120.0) - np.log2(20.0)))
-		elif f < 1000.0:
-			target[i] = 0.0
-		else:
-			target[i] = treble_tilt_db_per_oct * np.log2(f / 1000.0)
+	if params.curve == "harman":
+		# Fixed Harman shape — does not recurse, user bass/treble/etc. params are ignored.
+		# Layer 1: bass shelf with fixed corner=100 Hz and boost=4 dB.
+		harman_shelf_corner = 100.0
+		log_20 = np.log2(20.0)
+		log_corner = np.log2(harman_shelf_corner)
+		f_clamp = np.clip(freqs, 20.0, harman_shelf_corner)
+		t = (np.log2(f_clamp) - log_20) / (log_corner - log_20)
+		bass = np.where(freqs < 20.0, 4.0, np.where(freqs < harman_shelf_corner, 4.0 * (1.0 - t), 0.0))
+		# Layer 2: fixed tilt -0.8 dB/oct from 1000 Hz.
+		tilt = -0.8 * np.log2(np.clip(freqs, 1000.0, None) / 1000.0)
+		# Layer 4: presence shelf at 2500 Hz, -1.5 dB.
+		presence = _high_shelf_db(freqs, 2500.0, -1.5)
+		target = bass + tilt + presence
+		return target
 
-	if curve == "harman":
-		target += _target_curve_db(freqs, "custom", max(4.0, bass_boost_db), min(-0.8, treble_tilt_db_per_oct))
+	# Custom (and any future) curve — additive layers.
+
+	# Layer 1 — bass shelf (vectorized).
+	shelf_corner = params.crossover_hz * 2.0
+	log_20 = np.log2(20.0)
+	log_corner = np.log2(shelf_corner)
+	f_clamp = np.clip(freqs, 20.0, shelf_corner)
+	t = (np.log2(f_clamp) - log_20) / (log_corner - log_20)
+	bass = np.where(
+		freqs < 20.0,
+		params.bass_boost_db,
+		np.where(freqs < shelf_corner, params.bass_boost_db * (1.0 - t), 0.0),
+	)
+	target += bass
+
+	# Layer 2 — treble tilt above tilt_anchor_hz.
+	tilt = params.treble_tilt_db_per_oct * np.log2(np.clip(freqs, params.tilt_anchor_hz, None) / params.tilt_anchor_hz)
+	target += tilt
+
+	# Layer 3 — mid-bass bell (skip when lift is zero).
+	if params.mid_bass_lift_db != 0.0:
+		log_ratio = np.log2(np.clip(freqs, 1.0, None) / params.mid_bass_lift_hz)
+		bell = params.mid_bass_lift_db / (1.0 + (log_ratio * params.mid_bass_lift_q) ** 2)
+		target += bell
+
+	# Layer 4 — presence shelf.
+	target += _high_shelf_db(freqs, params.presence_shelf_hz, params.presence_shelf_db)
+
+	# Layer 5 — air shelf.
+	target += _high_shelf_db(freqs, params.air_shelf_hz, params.air_shelf_db)
+
 	return target
 
 
@@ -202,13 +283,18 @@ def _null_guard_limit(freqs: np.ndarray, focus_mag_db: np.ndarray) -> np.ndarray
 	return max_boost
 
 
-def _freq_dependent_limits(freqs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-	"""Return (max_cut_db, max_boost_db) per frequency."""
+def _freq_dependent_limits(freqs: np.ndarray, crossover_hz: float = 60.0) -> Tuple[np.ndarray, np.ndarray]:
+	"""Return (max_cut_db, max_boost_db) per frequency.
+
+	The bass/low-mid boundary tracks crossover_hz * 2.0 so that limit behavior
+	scales consistently when the crossover is changed.
+	"""
+	bass_boundary = crossover_hz * 2.0
 	max_cut = np.full_like(freqs, 4.0)
 	max_boost = np.full_like(freqs, 1.2)
 
-	bass = freqs <= 120.0
-	low_mid = (freqs > 120.0) & (freqs <= 500.0)
+	bass = freqs <= bass_boundary
+	low_mid = (freqs > bass_boundary) & (freqs <= 500.0)
 	high = freqs > 500.0
 
 	max_cut[bass] = 6.0
@@ -247,7 +333,7 @@ def _design_magnitude_correction(
 	modal_cut = -0.4 * np.clip(modal_excess, 0.0, 8.0)
 	raw += modal_cut
 
-	max_cut, max_boost = _freq_dependent_limits(freqs)
+	max_cut, max_boost = _freq_dependent_limits(freqs, crossover_hz=crossover_hz)
 	max_boost = np.minimum(max_boost, _null_guard_limit(freqs, focus_mag_db))
 
 	correction = np.clip(raw, -max_cut, max_boost)
@@ -289,6 +375,12 @@ def _synthesize_min_phase_fir(correction_db: np.ndarray, n_fft: int, fir_len: in
 
 	peak = np.max(np.abs(fir))
 	if peak > 0.99:
+		clip_db = 20.0 * np.log10(peak / 0.99)
+		print(
+			f"WARNING: magnitude FIR peak-clipped by {clip_db:.2f} dB "
+			"(midband RMS normalization overridden by peak limiter)",
+			file=sys.stderr,
+		)
 		fir = fir / peak * 0.99
 	return fir
 
@@ -306,7 +398,11 @@ def _design_phase_correction(
 
 	# Minimum-phase equivalent from measured magnitude.
 	h_min = _minimum_phase_spectrum_from_mag(mag, n_fft=n_fft)
-	h_excess = h_meas / np.where(np.abs(h_min) > EPS, h_min, EPS)
+	# Clamp denominator magnitude while preserving phase direction so the
+	# complex division never produces infinite or NaN values.
+	h_min_mag = np.abs(h_min)
+	h_min_safe = np.where(h_min_mag > EPS, h_min, EPS * np.exp(1j * np.angle(h_min)))
+	h_excess = h_meas / h_min_safe
 	phase_excess = _safe_unwrap(np.angle(h_excess))
 
 	# Remove linear trend (bulk delay) in bass alignment band.
@@ -317,10 +413,15 @@ def _design_phase_correction(
 
 	phase_corr = -phase_excess
 
-	# Apply smooth correction window around crossover/integration region.
+	# Apply smooth correction window that peaks AT the crossover frequency.
+	# win_low: 0→1 ramp from 15→25 Hz (sub-region gate).
+	# win_rise: 0→1 ramp from crossover/2 → crossover (rising flank).
+	# win_fall: 1→0 taper from crossover → correction_end_hz (falling flank).
+	# Together they form a tent with its apex at crossover_hz.
 	win_low = _raised_cosine_transition(freqs, 15.0, 25.0, invert=True)
-	win_high = _raised_cosine_transition(freqs, crossover_hz, correction_end_hz)
-	win = win_low * win_high
+	win_rise = _raised_cosine_transition(freqs, crossover_hz / 2.0, crossover_hz, invert=True)
+	win_fall = _raised_cosine_transition(freqs, crossover_hz, correction_end_hz)
+	win = win_low * win_rise * win_fall
 	phase_corr *= win
 	phase_corr = _smooth_log_freq(freqs, phase_corr, octave_fraction=8.0)
 
@@ -355,6 +456,11 @@ def _synthesize_phase_fir(phase_corr: np.ndarray, n_fft: int, fir_len: int) -> n
 
 	peak = np.max(np.abs(fir))
 	if peak > 0.99:
+		clip_db = 20.0 * np.log10(peak / 0.99)
+		print(
+			f"WARNING: phase FIR peak-clipped by {clip_db:.2f} dB",
+			file=sys.stderr,
+		)
 		fir = fir / peak * 0.99
 	return fir
 
@@ -389,14 +495,20 @@ class RoomCorrectionV4:
 		trim_latency: bool = True,
 		output_sample_rate: Optional[int] = None,
 		bit_depth: int = 32,
+		# New target-curve shaping params.
+		tilt_anchor_hz: float = 1000.0,
+		mid_bass_lift_db: float = 0.0,
+		mid_bass_lift_hz: float = 280.0,
+		mid_bass_lift_q: float = 1.2,
+		presence_shelf_db: float = 0.0,
+		presence_shelf_hz: float = 3000.0,
+		air_shelf_db: float = 0.0,
+		air_shelf_hz: float = 10000.0,
 	) -> None:
 		self.fs = int(sample_rate)
 		self.output_fs = int(output_sample_rate) if output_sample_rate else self.fs
 		self.mag_fir_length = int(mag_fir_length)
 		self.phase_fir_length = int(phase_fir_length)
-		self.target_curve = target_curve
-		self.bass_boost_db = float(bass_boost_db)
-		self.treble_tilt_db = float(treble_tilt_db)
 		self.crossover_freq = float(crossover_freq)
 		self.phase_correction_octaves = float(phase_correction_octaves)
 		self.phase_correction_end = self.crossover_freq * (2.0 ** self.phase_correction_octaves)
@@ -404,6 +516,20 @@ class RoomCorrectionV4:
 		self.enable_phase = bool(enable_phase)
 		self.trim_latency = bool(trim_latency)
 		self.bit_depth = int(bit_depth)
+		self.target_params = TargetCurveParams(
+			curve=target_curve,
+			bass_boost_db=float(bass_boost_db),
+			treble_tilt_db_per_oct=float(treble_tilt_db),
+			tilt_anchor_hz=float(tilt_anchor_hz),
+			mid_bass_lift_db=float(mid_bass_lift_db),
+			mid_bass_lift_hz=float(mid_bass_lift_hz),
+			mid_bass_lift_q=float(mid_bass_lift_q),
+			presence_shelf_db=float(presence_shelf_db),
+			presence_shelf_hz=float(presence_shelf_hz),
+			air_shelf_db=float(air_shelf_db),
+			air_shelf_hz=float(air_shelf_hz),
+			crossover_hz=self.crossover_freq,
+		)
 
 	def _build_channel(
 		self,
@@ -424,7 +550,7 @@ class RoomCorrectionV4:
 
 		global_mag = _robust_global_average(global_irs, n_fft=n_fft, fs=self.fs)
 		focus_mag = _focus_response(focus_ir, n_fft=n_fft, fs=self.fs)
-		target = _target_curve_db(freqs, self.target_curve, self.bass_boost_db, self.treble_tilt_db)
+		target = _target_curve_db(freqs, self.target_params)
 
 		mag = _design_magnitude_correction(
 			freqs=freqs,
@@ -603,22 +729,30 @@ def main() -> int:
 		help="Single focus listening-position IR for right channel.",
 	)
 
-	parser.add_argument("--sample_rate", type=int, default=48000, help="Input measurement sample rate in Hz.")
-	parser.add_argument("--output_sample_rate", type=int, default=None, help="Optional output filter sample rate.")
-	parser.add_argument("--mag_fir_length", type=int, default=8192, help="Magnitude FIR length.")
-	parser.add_argument("--fir_length", type=int, default=16384, help="Phase FIR length.")
-	parser.add_argument("--target_curve", choices=["flat", "custom", "harman"], default="custom", help="Target response profile.")
+	parser.add_argument("--air_shelf_db", type=float, default=0.0, help="Air shelf gain in dB at air_shelf_hz (range -9..3).")
+	parser.add_argument("--air_shelf_hz", type=float, default=10000.0, help="Air shelf corner frequency in Hz (range 6000..16000).")
 	parser.add_argument("--bass_boost_db", type=float, default=5.0, help="Low-frequency target lift in dB.")
-	parser.add_argument("--treble_tilt_db", type=float, default=-0.8, help="Treble tilt per octave above 1 kHz.")
-	parser.add_argument("--crossover_freq", type=float, default=60.0, help="Main/sub crossover reference in Hz.")
-	parser.add_argument("--phase_correction_octaves", type=float, default=1.6, help="Phase-correction span above crossover.")
-	parser.add_argument("--preserve_bass_floor_db", type=float, default=-1.5, help="Minimum allowed correction around bass anchor.")
-	parser.add_argument("--combined", action="store_true")
-	parser.add_argument("--no_phase", action="store_true")
 	parser.add_argument("--bit_depth", type=int, choices=[16, 24, 32], default=32, help="Output WAV bit depth.")
+	parser.add_argument("--combined", action="store_true")
+	parser.add_argument("--crossover_freq", type=float, default=60.0, help="Main/sub crossover reference in Hz.")
+	parser.add_argument("--fir_length", type=int, default=16384, help="Phase FIR length.")
+	parser.add_argument("--mag_fir_length", type=int, default=8192, help="Magnitude FIR length.")
+	parser.add_argument("--mid_bass_lift_db", type=float, default=0.0, help="Mid-bass bell gain in dB (range -6..6).")
+	parser.add_argument("--mid_bass_lift_hz", type=float, default=280.0, help="Mid-bass bell centre frequency in Hz (range 150..500).")
+	parser.add_argument("--mid_bass_lift_q", type=float, default=1.2, help="Mid-bass bell Q in log-frequency units (range 0.5..4).")
+	parser.add_argument("--no_phase", action="store_true")
 	parser.add_argument("--out", type=str, default="wavealign_filter.wav", help="Output WAV path.")
+	parser.add_argument("--output_sample_rate", type=int, default=None, help="Optional output filter sample rate.")
+	parser.add_argument("--phase_correction_octaves", type=float, default=1.6, help="Phase-correction span above crossover.")
 	parser.add_argument("--plot", type=str, default=None, help="Optional PNG output for diagnostics plot.")
+	parser.add_argument("--presence_shelf_db", type=float, default=0.0, help="Presence shelf gain in dB (range -9..3).")
+	parser.add_argument("--presence_shelf_hz", type=float, default=3000.0, help="Presence shelf corner frequency in Hz (range 1500..6000).")
+	parser.add_argument("--preserve_bass_floor_db", type=float, default=-1.5, help="Minimum allowed correction around bass anchor.")
 	parser.add_argument("--report_json", type=str, default=None, help="Optional JSON summary report path.")
+	parser.add_argument("--sample_rate", type=int, default=48000, help="Input measurement sample rate in Hz.")
+	parser.add_argument("--target_curve", choices=["flat", "custom", "harman"], default="custom", help="Target response profile.")
+	parser.add_argument("--tilt_anchor_hz", type=float, default=1000.0, help="Treble tilt anchor frequency in Hz (range 200..5000).")
+	parser.add_argument("--treble_tilt_db", type=float, default=-0.8, help="Treble tilt per octave above tilt_anchor_hz.")
 
 	args = parser.parse_args()
 
@@ -635,6 +769,14 @@ def main() -> int:
 		enable_phase=not args.no_phase,
 		output_sample_rate=args.output_sample_rate,
 		bit_depth=args.bit_depth,
+		tilt_anchor_hz=args.tilt_anchor_hz,
+		mid_bass_lift_db=args.mid_bass_lift_db,
+		mid_bass_lift_hz=args.mid_bass_lift_hz,
+		mid_bass_lift_q=args.mid_bass_lift_q,
+		presence_shelf_db=args.presence_shelf_db,
+		presence_shelf_hz=args.presence_shelf_hz,
+		air_shelf_db=args.air_shelf_db,
+		air_shelf_hz=args.air_shelf_hz,
 	)
 
 	try:
@@ -681,6 +823,14 @@ def main() -> int:
 				"target_curve": args.target_curve,
 				"bass_boost_db": args.bass_boost_db,
 				"treble_tilt_db_per_oct": args.treble_tilt_db,
+				"tilt_anchor_hz": args.tilt_anchor_hz,
+				"mid_bass_lift_db": args.mid_bass_lift_db,
+				"mid_bass_lift_hz": args.mid_bass_lift_hz,
+				"mid_bass_lift_q": args.mid_bass_lift_q,
+				"presence_shelf_db": args.presence_shelf_db,
+				"presence_shelf_hz": args.presence_shelf_hz,
+				"air_shelf_db": args.air_shelf_db,
+				"air_shelf_hz": args.air_shelf_hz,
 				"preserve_bass_floor_db": args.preserve_bass_floor_db,
 				"left": {
 					"correction_min_db": float(np.min(left.correction_db)),

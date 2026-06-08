@@ -144,6 +144,25 @@ ENV/
 env.bak/
 venv.bak/
 
+# macOS
+.DS_Store
+
+# WaveAlign — local artifacts and user-private data
+# Generated run artifacts at repo root
+wavealign_filter.wav
+wavealign_*_magnitude.wav
+wavealign_*_phase.wav
+wavealign_plot.png
+wavealign_comparison.png
+wavealign_raw_response.png
+wavealign_report.json
+
+# Local-only directories (memory store, A/B comparison renders, ad-hoc outputs)
+memory/
+ab/
+out/
+runs/
+
 # Spyder project settings
 .spyderproject
 .spyproject
